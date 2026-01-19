@@ -354,17 +354,139 @@ def add_markdown_headings(text: str) -> str:
     return "\n".join(out).strip()
 
 
+_MD_HR_RE = re.compile(r"^\s*(?:---|\*\*\*|___)\s*$")
+_MD_FENCE_RE = re.compile(r"^\s*```")
+
+def normalize_markdown_spacing(text: str) -> str:
+    """
+    让正文更符合常用 Markdown 阅读习惯（可读性兜底，不做复杂语义解析）：
+    - 对“疑似自然段边界”的单换行，提升为“段落空行”（插入一个空行）
+    - 标题/分隔线前后保证空行
+    - 连续空行最多保留2个
+    - 尽量不干扰引用块/列表/代码块
+    """
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    lines = [ln.rstrip() for ln in t.split("\n")]
+
+    def is_blank(x: str) -> bool:
+        return not x.strip()
+
+    def is_heading(x: str) -> bool:
+        return x.lstrip().startswith("#")
+
+    def is_hr(x: str) -> bool:
+        return bool(_MD_HR_RE.match(x.strip()))
+
+    def is_quote(x: str) -> bool:
+        return x.lstrip().startswith(">")
+
+    def is_list_item(x: str) -> bool:
+        xs = x.lstrip()
+        if re.match(r"^(\-|\*|\+)\s+\S+", xs):
+            return True
+        if re.match(r"^\d+\.\s+\S+", xs):
+            return True
+        return False
+
+    def ends_paragraph(x: str) -> bool:
+        xs = x.strip()
+        if not xs:
+            return False
+        # 常见段落结尾：句末标点/引号/省略号等
+        enders = "。！？!?…"
+        if xs[-1] in enders:
+            return True
+        # 对话常见：……”
+        if xs.endswith("……") or xs.endswith("...") or xs.endswith("……】"):
+            return True
+        if xs[-1] in "”』」）】":
+            if len(xs) >= 2 and xs[-2] in enders:
+                return True
+        return False
+
+    out: list[str] = []
+    in_code = False
+    i = 0
+    while i < len(lines):
+        cur = lines[i]
+
+        # 代码围栏：尽量保持原样
+        if _MD_FENCE_RE.match(cur):
+            in_code = not in_code
+            out.append(cur)
+            i += 1
+            continue
+
+        if in_code:
+            out.append(cur)
+            i += 1
+            continue
+
+        # 空行：压缩到最多2个
+        if is_blank(cur):
+            j = i
+            while j < len(lines) and is_blank(lines[j]):
+                j += 1
+            # 保留最多2个空行
+            out.append("")
+            if j - i >= 2:
+                out.append("")
+            i = j
+            continue
+
+        out.append(cur)
+        j = i + 1
+        if j >= len(lines):
+            break
+        nxt = lines[j]
+
+        # 原本就有空行：交给下一轮
+        if is_blank(nxt):
+            i += 1
+            continue
+
+        # 引用块：不改（我们程序生成的引用块已经很规范）
+        if is_quote(cur) or is_quote(nxt):
+            i += 1
+            continue
+
+        # 列表：不插空行，避免列表断裂
+        if is_list_item(cur) and is_list_item(nxt):
+            i += 1
+            continue
+
+        # 标题/分隔线：前后留空行（这里处理“cur 与 nxt 之间”）
+        if is_heading(cur) or is_hr(cur) or is_heading(nxt) or is_hr(nxt):
+            out.append("")
+            i += 1
+            continue
+
+        # 普通文本：仅在“疑似段落结束”时插入空行
+        if ends_paragraph(cur):
+            out.append("")
+        i += 1
+
+    # 去掉末尾多余空行
+    while out and is_blank(out[-1]):
+        out.pop()
+    return "\n".join(out).strip()
+
+
 def postprocess_formatted_text(text: str) -> str:
     """
     对模型输出的 formatted 做最后兜底：
     - 去元信息
     - 英文标点->中文标点（中文上下文）
     - 补 Markdown 标题
+    - Markdown段落空行（提高可读性/渲染一致性）
     """
     t = (text or "").strip()
     t = strip_metadata_lines(t)
     t = normalize_punctuation_zh(t)
     t = add_markdown_headings(t)
+    t = normalize_markdown_spacing(t)
     return t.strip()
 
 
@@ -539,8 +661,10 @@ FORMAT_RULES = """你只能对文本“格式”做优化（标点、换行、�
 6) 删除“作者信息/来源/写作时间/网站地址/链接/转载声明/版权声明/QQ群/公众号”等非正文元信息（通常位于开头或结尾）。"""
 
 MARKDOWN_RULES = """Markdown排版增强（能做就做）：
+- 自然段落之间必须用“空一行”分隔（Markdown段落需要空行）：每个自然段之间至少保留1个空行。
+- 对话建议“一人一句成段”，不同人物说话尽量分成不同段落。
 - 章节/卷/回/番外/序章等标题行：尽量使用Markdown标题（优先 `## 标题`；整书大标题可用 `# 标题`）。
-- 需要分隔的地方：优先使用 `---`。
+- 需要分隔的地方：优先使用 `---`，并保证分隔线前后各有空行。
 - 不要滥用列表/表格；保证小说正文可读性。"""
 
 SUMMARY_RULES = """请写一段较短但信息密度高的综述，尽量包含：主线、关键人物关系、核心冲突、阶段性转折、结局走向；如果原文未完结/无结局，请明确说明。"""
