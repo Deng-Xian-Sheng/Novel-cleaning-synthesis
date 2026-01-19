@@ -5,12 +5,12 @@
 小说数据合成脚本（生成 OpenAI messages 格式 jsonl）
 
 核心目标：
-- 读取“小说”目录中的文本
+- 读取小说文本
 - 清洗（仅做格式修正，不改写内容）
 - 生成：用户提示词 / 综述 / 分段综述 / 整理后的小说正文
 - 输出为训练数据 jsonl（OpenAI messages）
 
-重要设计说明（按用户需求调整）：
+重要设计说明：
 1) 该接口不支持 system role，因此“系统提示词”应当视为普通文本指令并入 user content。
    但不同步骤需要的指令不同：格式清洗≠总结≠生成用户提示词。
    => 本脚本为不同步骤使用不同的提示词（避免无关约束让模型困惑）。
@@ -217,58 +217,229 @@ def read_text_file(path: str) -> Tuple[bool, str, str]:
 
 
 # ---------------------------
+# 进一步后处理：中文标点/元信息去除/标题markdown（程序兜底）
+# ---------------------------
+
+_CJK_RANGE_RE = re.compile(r"[\u3400-\u9FFF]")  # CJK扩展A+基本区
+
+def _is_cjk(ch: str) -> bool:
+    return bool(ch) and bool(_CJK_RANGE_RE.match(ch))
+
+
+def normalize_punctuation_zh(text: str) -> str:
+    """
+    将常见英文标点在“中文上下文”中替换为中文标点（程序兜底，不完全依赖模型）：
+    , . ? ! : ; () [] -> ， 。 ？ ！ ： ； （） 【】
+    """
+    if not text:
+        return text
+
+    s = text
+    out: List[str] = []
+    n = len(s)
+
+    def prev_char(i: int) -> str:
+        return s[i - 1] if i - 1 >= 0 else ""
+
+    def next_char(i: int) -> str:
+        return s[i + 1] if i + 1 < n else ""
+
+    for i, ch in enumerate(s):
+        p = prev_char(i)
+        nx = next_char(i)
+
+        # 句点：避免小数 3.14
+        if ch == ".":
+            if (p.isdigit() and nx.isdigit()):
+                out.append(ch)
+            elif _is_cjk(p) or _is_cjk(nx):
+                out.append("。")
+            else:
+                out.append(ch)
+            continue
+
+        mapping = {
+            ",": "，",
+            "?": "？",
+            "!": "！",
+            ":": "：",
+            ";": "；",
+            "(": "（",
+            ")": "）",
+            "[": "【",
+            "]": "】",
+        }
+        if ch in mapping:
+            if _is_cjk(p) or _is_cjk(nx):
+                out.append(mapping[ch])
+            else:
+                out.append(ch)
+            continue
+
+        out.append(ch)
+
+    return "".join(out)
+
+
+_METADATA_LINE_RE = re.compile(
+    r"""^\s*(?:
+    作者|作\s*者|Author|
+    书名|作品名|小说名|
+    写作时间|创作时间|更新时间|发布时间|更新于|发表于|
+    来源|出处|首发|转载|转自|来自|
+    网站|网址|链接|地址|
+    QQ群|群号|公众号|微信|微博|
+    TXT|TXT下载|电子书|完整版|全文|
+    扫描|校对|排版|整理|制作|上传|
+    版权|声明|免责声明
+    )\s*[:：]?\s*.*$""",
+    flags=re.X | re.I,
+)
+
+_URL_LINE_RE = re.compile(r"^\s*(https?://\S+|www\.\S+)\s*$", flags=re.I)
+
+
+def strip_metadata_lines(text: str, *, head: int = 30, tail: int = 30) -> str:
+    """
+    尝试删除明显的作者/网站/时间/来源等元信息行（只在开头/结尾窗口内删除，降低误伤）。
+    """
+    if not text:
+        return text
+    lines = text.splitlines()
+    n = len(lines)
+    keep: List[str] = []
+    for idx, ln in enumerate(lines):
+        s = ln.strip()
+        in_window = (idx < head) or (idx >= max(0, n - tail))
+        if in_window:
+            if not s:
+                keep.append(ln)
+                continue
+            if _URL_LINE_RE.match(s):
+                continue
+            if _METADATA_LINE_RE.match(s):
+                continue
+            # 常见“本书来自xx/更多精彩请访问xx”
+            if ("本书来自" in s) or ("更多精彩" in s and ("访问" in s or "下载" in s)):
+                continue
+        keep.append(ln)
+    return "\n".join(keep).strip()
+
+
+_CHAPTER_TITLE_RE = re.compile(r"^\s*(第[0-9一二三四五六七八九十百千两]+[章节回卷部集][^\n]{0,30})\s*$")
+_SPECIAL_TITLE_RE = re.compile(r"^\s*(序章|序言|楔子|引子|前言|后记|尾声|番外)\s*$")
+
+
+def add_markdown_headings(text: str) -> str:
+    """
+    程序兜底：对明显的章节标题行补上 Markdown 标题符号（避免模型漏加）。
+    仅对整行匹配的标题操作，避免误伤正文。
+    """
+    if not text:
+        return text
+    out: List[str] = []
+    for ln in text.splitlines():
+        raw = ln.rstrip()
+        s = raw.strip()
+        if not s:
+            out.append(raw)
+            continue
+        if s.startswith("#"):
+            out.append(raw)
+            continue
+        if _CHAPTER_TITLE_RE.match(s) or _SPECIAL_TITLE_RE.match(s):
+            out.append("## " + s)
+            continue
+        out.append(raw)
+    return "\n".join(out).strip()
+
+
+def postprocess_formatted_text(text: str) -> str:
+    """
+    对模型输出的 formatted 做最后兜底：
+    - 去元信息
+    - 英文标点->中文标点（中文上下文）
+    - 补 Markdown 标题
+    """
+    t = (text or "").strip()
+    t = strip_metadata_lines(t)
+    t = normalize_punctuation_zh(t)
+    t = add_markdown_headings(t)
+    return t.strip()
+
+
+def postprocess_short_text(text: str) -> str:
+    """
+    给 summary / chunk_summary / user_prompt 做轻量后处理（主要是中文标点）。
+    """
+    t = (text or "").strip()
+    t = normalize_punctuation_zh(t)
+    return t.strip()
+
+
+# ---------------------------
 # 分块（处理超长文本）
 # ---------------------------
 
-def chunk_text(text: str, max_chars: int, overlap: int = 200) -> List[str]:
+def chunk_text(text: str, max_chars: int, *, lookback: int = 100) -> List[str]:
+    """
+    分片优化：
+    - 优先在接近 max_chars 处向前找“换行”
+    - 其次找句末标点（。！？?!）
+    - 都找不到才硬切
+    lookback：向前搜索范围（建议 100）
+    """
     if len(text) <= max_chars:
         return [text]
 
-    paras = text.split("\n\n")
     chunks: List[str] = []
-    cur: List[str] = []
-    cur_len = 0
+    i = 0
+    n = len(text)
 
-    def flush():
-        nonlocal cur, cur_len
-        if not cur:
-            return
-        c = "\n\n".join(cur).strip()
-        if c:
-            chunks.append(c)
-        cur = []
-        cur_len = 0
+    sentence_delims = ["。", "！", "？", "!", "?"]
 
-    for p in paras:
-        p = p.strip()
-        if not p:
-            continue
-        add_len = len(p) + (2 if cur else 0)
-        if cur_len + add_len <= max_chars:
-            cur.append(p)
-            cur_len += add_len
+    while i < n:
+        end = min(n, i + max_chars)
+        if end >= n:
+            cut = n
         else:
-            if len(p) > max_chars:
-                flush()
-                start = 0
-                while start < len(p):
-                    end = min(len(p), start + max_chars)
-                    chunks.append(p[start:end].strip())
-                    start = end - overlap if end < len(p) else end
-            else:
-                flush()
-                cur.append(p)
-                cur_len = len(p)
-    flush()
+            win_start = max(i, end - max(1, int(lookback)))
+            window = text[win_start:end]
 
-    if overlap > 0 and len(chunks) >= 2:
-        out: List[str] = []
-        out.append(chunks[0])
-        prev_tail = chunks[0][-overlap:]
-        for c in chunks[1:]:
-            out.append((prev_tail + "\n" + c).strip())
-            prev_tail = c[-overlap:]
-        return out
+            cut = None
+
+            # 1) 换行优先
+            nl = window.rfind("\n")
+            if nl != -1:
+                candidate = win_start + nl + 1
+                if candidate > i:
+                    cut = candidate
+
+            # 2) 句末标点
+            if not cut:
+                best = -1
+                for d in sentence_delims:
+                    pos = window.rfind(d)
+                    if pos > best:
+                        best = pos
+                if best != -1:
+                    candidate = win_start + best + 1
+                    if candidate > i:
+                        cut = candidate
+
+            # 3) 硬切兜底
+            if not cut or cut <= i:
+                cut = end
+
+        piece = text[i:cut].strip()
+        if piece:
+            chunks.append(piece)
+
+        # 保障前进
+        if cut <= i:
+            i = end
+        else:
+            i = cut
 
     return chunks
 
@@ -358,11 +529,19 @@ def build_payload(user_content: str, cfg: ChatConfig, *, template: str) -> Dict:
 BASE_XML_INSTRUCTIONS = """你是一个严格的文本处理助手。你必须严格按要求输出XML标签，不要输出任何额外解释、前后缀、代码块。"""
 
 FORMAT_RULES = """你只能对文本“格式”做优化（标点、换行、段落、标题、少量Markdown排版），不得改写小说表达的意义与具体内容。
+
 必须遵守：
 1) 统一输出为【简体中文】：如果原文包含繁体字，请转换为简体字（不改变含义）。
-2) 清理无意义符号与连续标点：将明显无意义的重复标点/分隔符压缩或移除（例如“。。。。。”、“———”、“======”、“＊＊＊＊＊”等）。
-3) 若原文用纯符号做分隔（如一行全是“====”/“——”/“***”），请改为Markdown分隔线：`---`。
-4) 允许删除明显无意义/广告/重复/乱码碎片；若发现内容位置错乱，可以通过移动其位置来修复，但不得凭空编造。"""
+2) 将英文标点符号替换为中文标点符号（在中文语境下）：, . ? ! : ; ( ) [ ] -> ， 。 ？ ！ ： ； （） 【】。
+3) 清理无意义符号与连续标点：将明显无意义的重复标点/分隔符压缩或移除（例如“。。。。。”、“———”、“======”、“＊＊＊＊＊”等）。
+4) 若原文用纯符号做分隔（如一行全是“====”/“——”/“***”），请改为Markdown分隔线：`---`。
+5) 允许删除明显无意义/广告/重复/乱码碎片；若发现内容位置错乱，可以通过移动其位置来修复，但不得凭空编造。
+6) 删除“作者信息/来源/写作时间/网站地址/链接/转载声明/版权声明/QQ群/公众号”等非正文元信息（通常位于开头或结尾）。"""
+
+MARKDOWN_RULES = """Markdown排版增强（能做就做）：
+- 章节/卷/回/番外/序章等标题行：尽量使用Markdown标题（优先 `## 标题`；整书大标题可用 `# 标题`）。
+- 需要分隔的地方：优先使用 `---`。
+- 不要滥用列表/表格；保证小说正文可读性。"""
 
 SUMMARY_RULES = """请写一段较短但信息密度高的综述，尽量包含：主线、关键人物关系、核心冲突、阶段性转折、结局走向；如果原文未完结/无结局，请明确说明。"""
 
@@ -379,6 +558,7 @@ FORMAT_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 你将收到小说原文（可能包含乱码、缺标点、断行紊乱等）。请完成：整理小说格式。
 
 {FORMAT_RULES}
+{MARKDOWN_RULES}
 
 输出要求（非常重要）：
 1) 只输出一个<format>根标签，内部必须包含且仅包含一个标签：<formatted>
@@ -400,15 +580,17 @@ FORMAT_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 CHUNK_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
 你将收到小说的一部分片段（chunk）。请完成两件事：
-1) 整理该片段的格式（不得改变意义，可修正标点/换行/少量Markdown，可删除明显无意义重复/乱码）。
+1) 整理该片段的格式（不得改变意义，可修正标点/换行/少量Markdown，可删除明显无意义重复/乱码/元信息）。
 2) 为该片段写一个“片段摘要”（用于后续合并为总综述，也会用于训练数据中的“前文提要”）。
 
 {FORMAT_RULES}
+{MARKDOWN_RULES}
 
 片段摘要要求：
 - 尽量客观、精炼、覆盖本片段新增的关键情节与人物动作
 - 不要写评价，不要写推理过程
 - 不要提“chunk/片段/摘要”字样，直接描述内容即可
+- 尽量使用中文标点（，。！？：；等）
 
 输出要求（非常重要）：
 - 只输出一个<chunk>根标签，内部必须包含两个标签：<formatted>、<chunk_summary>
@@ -480,7 +662,6 @@ FINAL_FROM_SUMMARIES_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 </summaries>
 """
 
-# 单独生成“用户提示词”（用 creative template）
 USER_PROMPT_FROM_SUMMARY_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
 你将收到一段“综述”。请生成一条用户提示词。
@@ -504,7 +685,7 @@ USER_PROMPT_FROM_SUMMARY_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 </summary>
 """
 
-# 可选：如果需要“一步到位”把总综述+用户提示词一起生成（备用/兜底）
+# 兜底：一步到位生成 summary + user_prompt
 FINAL_BOTH_FROM_SUMMARIES_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
 你将收到多个片段摘要，请合并为小说的总综述，并基于总综述生成用户提示词。
@@ -534,6 +715,7 @@ FINAL_BOTH_FROM_SUMMARIES_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 {{summaries}}
 </summaries>
 """
+
 
 # ---------------------------
 # XML 解析
@@ -683,7 +865,6 @@ def repair_xml(raw: str, *, kind: str, cfg: ChatConfig, label: str, template_rep
     kind: format / summary / user_prompt / chunk / final / final_both
     返回修复后的raw（仍需再次parse验证）
     """
-    # 避免标记冲突（极小概率）
     safe_raw = raw.replace("<<<RAW_OUTPUT", "<<<RAW_OUT").replace("RAW_OUTPUT>>>", "RAW_OUT>>>")
 
     if kind == "format":
@@ -731,10 +912,53 @@ def call_with_retries(fn, *, max_retries: int, base_delay: float = 2.0, max_dela
 # 输出拼装（把综述/前文提要用引用块插入assistant内容）
 # ---------------------------
 
+def _wrap_line_zh(line: str, max_len: int = 60, backtrack: int = 12) -> List[str]:
+    """
+    把一行超长中文文本按标点/长度进行软换行（用于引用块可读性）。
+    """
+    s = (line or "").strip()
+    if not s:
+        return [""]
+    res: List[str] = []
+    punct = "，。！？；：、"
+    while len(s) > max_len:
+        cut = max_len
+        window = s[: max_len + 1]
+        best = -1
+        for p in punct:
+            pos = window.rfind(p)
+            if pos > best:
+                best = pos
+        if best >= max_len - backtrack and best > 0:
+            cut = best + 1
+        res.append(s[:cut].rstrip())
+        s = s[cut:].lstrip()
+    if s:
+        res.append(s)
+    return res
+
+
+def wrap_zh_text(text: str, *, max_len: int = 60) -> str:
+    """
+    保留原始换行；若单行过长则按中文标点/长度拆行。
+    """
+    if not text:
+        return ""
+    out: List[str] = []
+    for ln in text.splitlines():
+        if not ln.strip():
+            out.append("")
+            continue
+        out.extend(_wrap_line_zh(ln, max_len=max_len))
+    return "\n".join(out).strip()
+
+
 def _quote_block(title: str, body: str) -> str:
     body = (body or "").strip()
     if not body:
         return ""
+    body = wrap_zh_text(body, max_len=60)
+
     lines = body.splitlines()
     out: List[str] = [f"> **{title}**", ">"]
     for ln in lines:
@@ -796,19 +1020,15 @@ def process_text(
     template_creative: str,
     template_repair: str,
     max_input_chars: int,
+    chunk_lookback: int,
     label: str,
     max_retries: int,
 ) -> ProcessTextResult:
     """
-    分步骤策略（更贴合不同template）：
+    分步骤策略：
     - format：logical
     - summary：summary
     - user_prompt：creative
-
-    分片策略：
-    - 每个chunk独立重试/修复，不整本打回
-    - final(summary合并)独立重试/修复
-    - user_prompt生成独立重试/修复
     """
 
     def format_attempt(x: str) -> str:
@@ -874,7 +1094,7 @@ def process_text(
         if PRINT_MODEL_OUTPUT:
             _print_model_output(f"{label}::final_summary", raw)
         try:
-            return parse_summary_xml(raw)  # <final>里也用<summary>，解析同一标签即可
+            return parse_summary_xml(raw)
         except ValueError:
             if not XML_REPAIR:
                 raise
@@ -898,35 +1118,46 @@ def process_text(
     # 非分片：format -> summary -> user_prompt
     if len(text) <= max_input_chars:
         formatted = call_with_retries(lambda: format_attempt(text), max_retries=max_retries)
+        formatted = postprocess_formatted_text(formatted)
         time.sleep(cfg.min_delay)
+
         summary = call_with_retries(lambda: summary_from_formatted_attempt(formatted), max_retries=max_retries)
+        summary = postprocess_short_text(summary)
         time.sleep(cfg.min_delay)
+
         user_prompt = call_with_retries(lambda: user_prompt_from_summary_attempt(summary), max_retries=max_retries)
+        user_prompt = postprocess_short_text(user_prompt)
         time.sleep(cfg.min_delay)
+
         return ProcessTextResult(formatted_parts=[formatted], summary=summary, chunk_summaries=[], user_prompt=user_prompt)
 
     # 分片：chunk(format+chunk_summary) -> final_summary -> user_prompt
-    chunks = chunk_text(text, max_chars=max_input_chars, overlap=200)
+    chunks = chunk_text(text, max_chars=max_input_chars, lookback=chunk_lookback)
     formatted_parts: List[str] = []
     chunk_summaries: List[str] = []
 
     for i, ch in enumerate(chunks, start=1):
         fpart, s = call_with_retries(lambda: chunk_attempt(ch, i), max_retries=max_retries)
-        formatted_parts.append(fpart.strip())
-        chunk_summaries.append(s.strip())
+        formatted_parts.append(postprocess_formatted_text(fpart))
+        chunk_summaries.append(postprocess_short_text(s))
         time.sleep(cfg.min_delay)
 
-    # final summary 单独重试（不重跑chunks）
     summaries_text = "\n".join([f"[段落{i}] {s}" for i, s in enumerate(chunk_summaries, start=1)])
+
     try:
         summary = call_with_retries(lambda: final_summary_attempt(summaries_text), max_retries=max_retries)
+        summary = postprocess_short_text(summary)
         time.sleep(cfg.min_delay)
+
         user_prompt = call_with_retries(lambda: user_prompt_from_summary_attempt(summary), max_retries=max_retries)
+        user_prompt = postprocess_short_text(user_prompt)
         time.sleep(cfg.min_delay)
+
         return ProcessTextResult(formatted_parts=formatted_parts, summary=summary, chunk_summaries=chunk_summaries, user_prompt=user_prompt)
     except Exception:
-        # 兜底：一步到位生成 summary + user_prompt（不影响 chunk 格式化结果）
         summary2, up2 = call_with_retries(lambda: final_both_fallback_attempt(summaries_text), max_retries=max_retries)
+        summary2 = postprocess_short_text(summary2)
+        up2 = postprocess_short_text(up2)
         time.sleep(cfg.min_delay)
         return ProcessTextResult(formatted_parts=formatted_parts, summary=summary2, chunk_summaries=chunk_summaries, user_prompt=up2)
 
@@ -983,6 +1214,7 @@ def process_file(abs_path: str, rel_path: str, *, args, cfg: ChatConfig) -> Task
             template_creative=args.template_creative,
             template_repair=args.template_repair,
             max_input_chars=args.max_input_chars,
+            chunk_lookback=args.chunk_lookback,
             label=fid,
             max_retries=args.max_retries,
         )
@@ -998,10 +1230,9 @@ def process_file(abs_path: str, rel_path: str, *, args, cfg: ChatConfig) -> Task
                 {"role": "user", "content": r.user_prompt.strip()},
                 {"role": "assistant", "content": assistant_content.strip()},
             ],
-            # 扩展字段：按需求把“综述/每段综述/原文”都存下来
             "summary": (r.summary or "").strip(),
             "chunk_summaries": [s.strip() for s in (r.chunk_summaries or [])],
-            "source_text": text,  # 清洗后的原文（已统一换行/去控制字符等）
+            "source_text": text,
         }
 
         meta = {
@@ -1043,6 +1274,9 @@ def main():
     ap.add_argument("--min-delay", type=float, default=0.6, help="每个worker内请求间最小延迟秒数")
     ap.add_argument("--max-retries", type=int, default=4, help="单次API调用失败重试次数（指数退避）。分片模式下每个chunk与final都单独使用该值。")
     ap.add_argument("--max-input-chars", type=int, default=12000, help="单次喂给模型的最大字符数，超出则分块")
+
+    ap.add_argument("--chunk-lookback", type=int, default=100, help="分片时在 max-input-chars 附近向前寻找自然切分点的范围（优先换行，其次句号等；默认100）")
+
     ap.add_argument("--min-chars", type=int, default=200, help="过短文本跳过（默认200）")
     ap.add_argument("--max-files", type=int, default=0, help="最多处理多少个文件（0表示不限制）")
     ap.add_argument("--workers", type=int, default=1, help="并发worker数（默认1）")
@@ -1088,6 +1322,7 @@ def main():
     print(
         f"pending={len(pending)} workers={workers} "
         f"templates=format:{args.template_format} summary:{args.template_summary} creative:{args.template_creative} repair:{args.template_repair} "
+        f"chunk_lookback={args.chunk_lookback} "
         f"print_model_output={PRINT_MODEL_OUTPUT} xml_repair={XML_REPAIR}"
     )
 
