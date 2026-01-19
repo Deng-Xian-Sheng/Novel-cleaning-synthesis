@@ -4,20 +4,25 @@
 """
 小说数据合成脚本（生成 OpenAI messages 格式 jsonl）
 
-功能：
-- 递归遍历小说目录，识别文本文件（默认不打印路径/文件名/内容，只显示hash id）
-- 健壮解码：BOM -> charset_normalizer(可选) -> 多候选打分
-- 清洗：控制字符、换行、明显乱码替换符重复等
-- 调用 https://chat.dphn.ai/api/chat （SSE 流式响应）获取 XML 格式输出
-- 产出训练数据：{"messages":[{"role":"user","content": user_prompt}, {"role":"assistant","content": formatted}]}
-- 断点续跑：state 文件记录 done/failed（按文件相对路径hash）
-- 失败重试：指数退避
-- 并发：--workers N
-- 终端打印模型原始输出（默认开启）用于视觉反馈
-- 重点增强（按用户要求）：
-  1) 分片处理：仅失败分片重试（不整本打回）
-  2) final 汇总步骤单独重试
-  3) XML 不全：先做“修复追问”，再重试
+核心目标：
+- 读取“小说”目录中的文本
+- 清洗（仅做格式修正，不改写内容）
+- 生成：用户提示词 / 综述 / 分段综述 / 整理后的小说正文
+- 输出为训练数据 jsonl（OpenAI messages）
+
+重要设计说明（按用户需求调整）：
+1) 该接口不支持 system role，因此“系统提示词”应当视为普通文本指令并入 user content。
+   但不同步骤需要的指令不同：格式清洗≠总结≠生成用户提示词。
+   => 本脚本为不同步骤使用不同的提示词（避免无关约束让模型困惑）。
+
+2) template 选择：
+   - logical：适合做“格式修正/结构化输出/XML修复”
+   - summary ：适合做“综述/摘要合并”
+   - creative：适合做“用户提示词（让模型写小说的指令）”
+
+3) 分片策略：
+   - chunk 逐片处理：每片单独重试/修复（不整本打回）
+   - final 汇总步骤（合并总综述、生成用户提示词）也单独重试/修复
 """
 
 from __future__ import annotations
@@ -275,7 +280,6 @@ def chunk_text(text: str, max_chars: int, overlap: int = 200) -> List[str]:
 @dataclass
 class ChatConfig:
     model: str = "dolphinserver:24B"
-    template: str = "logical"
     timeout: int = 180
     min_delay: float = 0.6
 
@@ -338,11 +342,12 @@ def sse_chat_completion(payload: Dict, cfg: ChatConfig) -> str:
     return "".join(full)
 
 
-def build_payload(user_content: str, cfg: ChatConfig) -> Dict:
+def build_payload(user_content: str, cfg: ChatConfig, *, template: str) -> Dict:
+    # 接口不支持 system role，这里只发一个 user message
     return {
         "messages": [{"role": "user", "content": user_content}],
         "model": cfg.model,
-        "template": cfg.template,
+        "template": template,
     }
 
 
@@ -350,68 +355,66 @@ def build_payload(user_content: str, cfg: ChatConfig) -> Dict:
 # 提示词与XML解析
 # ---------------------------
 
-SYSTEM_PROMPT = """你是一个用于“小说文本整理与数据合成”的助手。你必须严格按用户要求输出XML标签，不要输出任何额外解释。
-你只能对格式做优化（标点、换行、段落、标题、少量Markdown排版），不得改写小说表达的意义与具体内容。
+BASE_XML_INSTRUCTIONS = """你是一个严格的文本处理助手。你必须严格按要求输出XML标签，不要输出任何额外解释、前后缀、代码块。"""
 
-硬性要求（必须遵守）：
+FORMAT_RULES = """你只能对文本“格式”做优化（标点、换行、段落、标题、少量Markdown排版），不得改写小说表达的意义与具体内容。
+必须遵守：
 1) 统一输出为【简体中文】：如果原文包含繁体字，请转换为简体字（不改变含义）。
 2) 清理无意义符号与连续标点：将明显无意义的重复标点/分隔符压缩或移除（例如“。。。。。”、“———”、“======”、“＊＊＊＊＊”等）。
-3) 若原文用纯符号做分隔（如一行全是“====”/“——”/“***”），请改为Markdown分隔线：`---`（或等价的Markdown水平分割线）。
+3) 若原文用纯符号做分隔（如一行全是“====”/“——”/“***”），请改为Markdown分隔线：`---`。
 4) 允许删除明显无意义/广告/重复/乱码碎片；若发现内容位置错乱，可以通过移动其位置来修复，但不得凭空编造。"""
 
-USER_PROMPT_TEMPLATE = """请阅读下方<xiaoshuo>中的小说原文（可能包含乱码、缺标点、断行紊乱等），并完成三件事：
+SUMMARY_RULES = """请写一段较短但信息密度高的综述，尽量包含：主线、关键人物关系、核心冲突、阶段性转折、结局走向；如果原文未完结/无结局，请明确说明。"""
 
-任务A：整理小说格式
-- 将繁体字转换为简体字，统一为简体中文输出（不得改变含义）。
-- 清理无意义的连续标点/符号分隔（如长串句号/破折号/等号/星号等）；原本纯符号分隔行用Markdown分隔线 `---` 替代。
-- 不改变原文意义与细节，不改写情节/人物设定/对话内容。
-- 允许：补全/修正标点；调整换行段落；补充合理的标题层级；用少量Markdown提升可读性（如章节标题、分隔线）。
-- 允许删除：明显无意义的重复、广告、水印、随机乱码碎片（例如长串无意义符号）。
-- 若有段落明显错位，可移动到更合适位置以恢复阅读顺序（不要新增内容）。
+USER_PROMPT_RULES = """基于给定的“综述”，生成一条【给大模型的用户指令】（user prompt），目标是让模型创作出与该小说一致的故事（人物、背景、冲突、走向尽量贴合）。
+要求：
+- 这条指令应当像真实用户在聊天框里发出的请求，不能提“根据综述/根据摘要/如下综述”等字眼。
+- 可长可短：短则抓住最突出的要点；长则覆盖更多细节。
+- 表达方式尽量多样（例如“请写一篇小说……/写个故事……/创作一段长篇……”等），但必须忠于综述，不要杜撰综述未提到的关键设定。
+- 尽量把“你希望模型写出来的东西”说清楚：题材风格（若能从综述推断）、主角/关系、开端处境、关键矛盾、故事节奏与结尾倾向（开放/悲剧/圆满等）。
+- 只输出一条用户提示词，不要多条备选。"""
 
-任务B：写一段“综述”
-- 用较短但精炼的文字概括小说内容，可包含主线、关键人物关系、冲突与结局走向（若原文无结局则说明）。
+FORMAT_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
-任务C：基于综述生成“用户提示词”
-- 这是一条给大模型的用户指令，目标是让模型写出与该小说一致的故事。
-- 表达方式尽量多样（例如“请写一篇小说……/写个故事……/创作一段长篇……”等），但必须忠于综述。
-- 用户提示词可以长或短：短则抓住最突出的要点；长则覆盖更多细节。
+你将收到小说原文（可能包含乱码、缺标点、断行紊乱等）。请完成：整理小说格式。
+
+{FORMAT_RULES}
 
 输出要求（非常重要）：
-1) 只输出一个<result>根标签，内部必须包含且仅包含三个标签：<formatted>、<summary>、<user_prompt>
-2) 标签必须成对闭合；不要输出任何多余文字，不要用代码块。
-3) <formatted>中放整理后的小说全文；<summary>放综述；<user_prompt>放用户提示词。
+1) 只输出一个<format>根标签，内部必须包含且仅包含一个标签：<formatted>
+2) 标签必须成对闭合；不要输出任何多余文字
 
-示例（仅示意格式，不代表内容）：
-<result>
+示例（仅示意格式）：
+<format>
 <formatted>
 ...整理后的正文...
 </formatted>
-<summary>
-...综述...
-</summary>
-<user_prompt>
-请写一篇小说，讲述……
-</user_prompt>
-</result>
+</format>
 
 下面是小说原文：
 <xiaoshuo>
-{xiaoshuo}
+{{xiaoshuo}}
 </xiaoshuo>
 """
 
-CHUNK_PROMPT_TEMPLATE = """你将收到小说的一部分片段（chunk）。请完成两件事：
-1) 整理该片段的格式（同样不得改变意义，可修正标点/换行/少量Markdown，可删除明显无意义重复/乱码）。
-   - 将繁体字转换为简体字，统一为简体中文输出（不得改变含义）。
-   - 清理无意义的连续标点/符号分隔；原本纯符号分隔行用Markdown分隔线 `---` 替代。
-2) 为该片段写一个极简“片段摘要”（用于后续合并为总综述）。
+CHUNK_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
+
+你将收到小说的一部分片段（chunk）。请完成两件事：
+1) 整理该片段的格式（不得改变意义，可修正标点/换行/少量Markdown，可删除明显无意义重复/乱码）。
+2) 为该片段写一个“片段摘要”（用于后续合并为总综述，也会用于训练数据中的“前文提要”）。
+
+{FORMAT_RULES}
+
+片段摘要要求：
+- 尽量客观、精炼、覆盖本片段新增的关键情节与人物动作
+- 不要写评价，不要写推理过程
+- 不要提“chunk/片段/摘要”字样，直接描述内容即可
 
 输出要求（非常重要）：
 - 只输出一个<chunk>根标签，内部必须包含两个标签：<formatted>、<chunk_summary>
-- 不要输出任何多余文字。
+- 不要输出任何多余文字
 
-示例（仅示意格式，不代表内容）：
+示例（仅示意格式）：
 <chunk>
 <formatted>
 ...整理后的片段...
@@ -423,17 +426,100 @@ CHUNK_PROMPT_TEMPLATE = """你将收到小说的一部分片段（chunk）。请
 
 片段如下：
 <xiaoshuo>
-{xiaoshuo}
+{{xiaoshuo}}
 </xiaoshuo>
 """
 
-FINAL_FROM_SUMMARIES_PROMPT_TEMPLATE = """你将收到多个片段摘要，请合并为小说的总综述，并基于总综述生成用户提示词。
+SUMMARY_FROM_FORMATTED_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
+
+你将收到“整理后的小说正文”。请基于该正文写一段总综述。
+
+{SUMMARY_RULES}
 
 输出要求（非常重要）：
-1) 只输出一个<final>根标签，内部必须包含两个标签：<summary>、<user_prompt>
-2) 不要输出任何多余文字。
+1) 只输出一个<summary_result>根标签，内部必须包含且仅包含：<summary>
+2) 不要输出任何多余文字
 
-示例（仅示意格式，不代表内容）：
+示例：
+<summary_result>
+<summary>
+...综述...
+</summary>
+</summary_result>
+
+整理后的小说正文如下：
+<formatted_text>
+{{formatted}}
+</formatted_text>
+"""
+
+FINAL_FROM_SUMMARIES_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
+
+你将收到多个“片段摘要”。请将它们合并为小说的总综述。
+
+{SUMMARY_RULES}
+
+额外要求：
+- 不要在综述中出现“第X段/第X片/chunk”等字样
+- 尽量去重、合并同义信息，保证连贯
+
+输出要求（非常重要）：
+1) 只输出一个<final>根标签，内部必须包含且仅包含：<summary>
+2) 不要输出任何多余文字
+
+示例：
+<final>
+<summary>
+...总综述...
+</summary>
+</final>
+
+片段摘要如下：
+<summaries>
+{{summaries}}
+</summaries>
+"""
+
+# 单独生成“用户提示词”（用 creative template）
+USER_PROMPT_FROM_SUMMARY_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
+
+你将收到一段“综述”。请生成一条用户提示词。
+
+{USER_PROMPT_RULES}
+
+输出要求（非常重要）：
+1) 只输出一个<prompt_result>根标签，内部必须包含且仅包含：<user_prompt>
+2) 不要输出任何多余文字
+
+示例：
+<prompt_result>
+<user_prompt>
+请写一篇小说，讲述……
+</user_prompt>
+</prompt_result>
+
+综述如下：
+<summary>
+{{summary}}
+</summary>
+"""
+
+# 可选：如果需要“一步到位”把总综述+用户提示词一起生成（备用/兜底）
+FINAL_BOTH_FROM_SUMMARIES_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
+
+你将收到多个片段摘要，请合并为小说的总综述，并基于总综述生成用户提示词。
+
+总综述要求：
+{SUMMARY_RULES}
+
+用户提示词要求：
+{USER_PROMPT_RULES}
+
+输出要求（非常重要）：
+1) 只输出一个<final>根标签，内部必须包含且仅包含两个标签：<summary>、<user_prompt>
+2) 不要输出任何多余文字
+
+示例：
 <final>
 <summary>
 ...总综述...
@@ -445,18 +531,100 @@ FINAL_FROM_SUMMARIES_PROMPT_TEMPLATE = """你将收到多个片段摘要，请�
 
 片段摘要如下：
 <summaries>
-{summaries}
+{{summaries}}
 </summaries>
 """
 
-REPAIR_RESULT_TEMPLATE = """你刚才的输出可能不是严格合规的XML，或缺少必要标签。
+# ---------------------------
+# XML 解析
+# ---------------------------
+
+def _extract_tag(text: str, tag: str) -> Optional[str]:
+    m = re.findall(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, flags=re.S | re.I)
+    if not m:
+        return None
+    return m[-1].strip()
+
+
+def parse_formatted_xml(raw: str) -> str:
+    formatted = _extract_tag(raw, "formatted")
+    if not formatted:
+        raise ValueError("XML不完整：缺少 <formatted>")
+    return formatted
+
+
+def parse_summary_xml(raw: str) -> str:
+    summary = _extract_tag(raw, "summary")
+    if summary is None:
+        raise ValueError("XML不完整：缺少 <summary>")
+    return summary.strip()
+
+
+def parse_user_prompt_xml(raw: str) -> str:
+    user_prompt = _extract_tag(raw, "user_prompt")
+    if not user_prompt:
+        raise ValueError("XML不完整：缺少 <user_prompt>")
+    return user_prompt.strip()
+
+
+def parse_chunk_xml(raw: str) -> Tuple[str, str]:
+    formatted = _extract_tag(raw, "formatted")
+    chunk_summary = _extract_tag(raw, "chunk_summary")
+    if not formatted or not chunk_summary:
+        raise ValueError("XML不完整：缺少 <formatted> 或 <chunk_summary>")
+    return formatted.strip(), chunk_summary.strip()
+
+
+def parse_final_both_xml(raw: str) -> Tuple[str, str]:
+    summary = _extract_tag(raw, "summary") or ""
+    user_prompt = _extract_tag(raw, "user_prompt")
+    if not user_prompt:
+        raise ValueError("XML不完整：缺少 <user_prompt>")
+    return summary.strip(), user_prompt.strip()
+
+
+# ---------------------------
+# XML 修复追问（尽量结构化）
+# ---------------------------
+
+REPAIR_FORMAT_TEMPLATE = """你刚才的输出可能不是严格合规的XML，或缺少必要标签。
 请你基于“原始输出文本”尽最大可能恢复为一个严格合规的XML，并且只输出XML本身。
 
 规则：
-- 必须只输出一个<result>根标签，且包含且仅包含：<formatted>、<summary>、<user_prompt>
+- 必须只输出一个<format>根标签，且包含且仅包含：<formatted>
 - 所有标签必须成对闭合
 - 不要输出任何解释、前后缀、代码块
-- 不要编造新内容：尽量从原始输出中提取并整理；如果某个标签确实无法从原始输出恢复，可留空字符串，但标签必须存在
+- 不要编造新内容：尽量从原始输出中提取并整理；如果无法恢复，可留空字符串，但标签必须存在
+
+原始输出文本如下（按原样提供）：
+<<<RAW_OUTPUT
+{raw}
+RAW_OUTPUT>>>
+"""
+
+REPAIR_SUMMARY_TEMPLATE = """你刚才的输出可能不是严格合规的XML，或缺少必要标签。
+请你基于“原始输出文本”尽最大可能恢复为一个严格合规的XML，并且只输出XML本身。
+
+规则：
+- 必须只输出一个<summary_result>根标签，且包含且仅包含：<summary>
+- 所有标签必须成对闭合
+- 不要输出任何解释、前后缀、代码块
+- 不要编造新内容：尽量从原始输出中提取并整理；如果无法恢复，可留空字符串，但标签必须存在
+
+原始输出文本如下（按原样提供）：
+<<<RAW_OUTPUT
+{raw}
+RAW_OUTPUT>>>
+"""
+
+REPAIR_USER_PROMPT_TEMPLATE = """你刚才的输出可能不是严格合规的XML，或缺少必要标签。
+请你基于“原始输出文本”尽最大可能恢复为一个严格合规的XML，并且只输出XML本身。
+
+规则：
+- 必须只输出一个<prompt_result>根标签，且包含且仅包含：<user_prompt>
+- 所有标签必须成对闭合
+- 不要输出任何解释、前后缀、代码块
+- 不要编造新内容：尽量从原始输出中提取并整理；如果无法恢复，可留空字符串，但标签必须存在
 
 原始输出文本如下（按原样提供）：
 <<<RAW_OUTPUT
@@ -471,7 +639,7 @@ REPAIR_CHUNK_TEMPLATE = """你刚才的输出可能不是严格合规的XML，�
 - 必须只输出一个<chunk>根标签，且包含且仅包含：<formatted>、<chunk_summary>
 - 所有标签必须成对闭合
 - 不要输出任何解释、前后缀、代码块
-- 不要编造新内容：尽量从原始输出中提取并整理；如果某个标签确实无法从原始输出恢复，可留空字符串，但标签必须存在
+- 不要编造新内容：尽量从原始输出中提取并整理；如果无法恢复，可留空字符串，但标签必须存在
 
 原始输出文本如下（按原样提供）：
 <<<RAW_OUTPUT
@@ -483,10 +651,25 @@ REPAIR_FINAL_TEMPLATE = """你刚才的输出可能不是严格合规的XML，�
 请你基于“原始输出文本”尽最大可能恢复为一个严格合规的XML，并且只输出XML本身。
 
 规则：
+- 必须只输出一个<final>根标签，且包含且仅包含：<summary>
+- 所有标签必须成对闭合
+- 不要输出任何解释、前后缀、代码块
+- 不要编造新内容：尽量从原始输出中提取并整理；如果无法恢复，可留空字符串，但标签必须存在
+
+原始输出文本如下（按原样提供）：
+<<<RAW_OUTPUT
+{raw}
+RAW_OUTPUT>>>
+"""
+
+REPAIR_FINAL_BOTH_TEMPLATE = """你刚才的输出可能不是严格合规的XML，或缺少必要标签。
+请你基于“原始输出文本”尽最大可能恢复为一个严格合规的XML，并且只输出XML本身。
+
+规则：
 - 必须只输出一个<final>根标签，且包含且仅包含：<summary>、<user_prompt>
 - 所有标签必须成对闭合
 - 不要输出任何解释、前后缀、代码块
-- 不要编造新内容：尽量从原始输出中提取并整理；如果某个标签确实无法从原始输出恢复，可留空字符串，但标签必须存在
+- 不要编造新内容：尽量从原始输出中提取并整理；如果无法恢复，可留空字符串，但标签必须存在
 
 原始输出文本如下（按原样提供）：
 <<<RAW_OUTPUT
@@ -495,55 +678,30 @@ RAW_OUTPUT>>>
 """
 
 
-def _extract_tag(text: str, tag: str) -> Optional[str]:
-    m = re.findall(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, flags=re.S | re.I)
-    if not m:
-        return None
-    return m[-1].strip()
-
-
-def parse_result_xml(raw: str) -> Tuple[str, str, str]:
-    formatted = _extract_tag(raw, "formatted")
-    summary = _extract_tag(raw, "summary") or ""
-    user_prompt = _extract_tag(raw, "user_prompt")
-    if not formatted or not user_prompt:
-        raise ValueError("XML不完整：缺少 <formatted> 或 <user_prompt>")
-    return formatted, summary, user_prompt
-
-
-def parse_chunk_xml(raw: str) -> Tuple[str, str]:
-    formatted = _extract_tag(raw, "formatted")
-    chunk_summary = _extract_tag(raw, "chunk_summary")
-    if not formatted or not chunk_summary:
-        raise ValueError("XML不完整：缺少 <formatted> 或 <chunk_summary>")
-    return formatted, chunk_summary
-
-
-def parse_final_xml(raw: str) -> Tuple[str, str]:
-    summary = _extract_tag(raw, "summary") or ""
-    user_prompt = _extract_tag(raw, "user_prompt")
-    if not user_prompt:
-        raise ValueError("XML不完整：缺少 <user_prompt>")
-    return summary, user_prompt
-
-
-def repair_xml(raw: str, *, kind: str, cfg: ChatConfig, label: str) -> str:
+def repair_xml(raw: str, *, kind: str, cfg: ChatConfig, label: str, template_repair: str) -> str:
     """
-    kind: result / chunk / final
+    kind: format / summary / user_prompt / chunk / final / final_both
     返回修复后的raw（仍需再次parse验证）
     """
     # 避免标记冲突（极小概率）
     safe_raw = raw.replace("<<<RAW_OUTPUT", "<<<RAW_OUT").replace("RAW_OUTPUT>>>", "RAW_OUT>>>")
-    if kind == "result":
-        prompt = REPAIR_RESULT_TEMPLATE.format(raw=safe_raw)
+
+    if kind == "format":
+        prompt = REPAIR_FORMAT_TEMPLATE.format(raw=safe_raw)
+    elif kind == "summary":
+        prompt = REPAIR_SUMMARY_TEMPLATE.format(raw=safe_raw)
+    elif kind == "user_prompt":
+        prompt = REPAIR_USER_PROMPT_TEMPLATE.format(raw=safe_raw)
     elif kind == "chunk":
         prompt = REPAIR_CHUNK_TEMPLATE.format(raw=safe_raw)
     elif kind == "final":
         prompt = REPAIR_FINAL_TEMPLATE.format(raw=safe_raw)
+    elif kind == "final_both":
+        prompt = REPAIR_FINAL_BOTH_TEMPLATE.format(raw=safe_raw)
     else:
         raise ValueError(f"unknown kind: {kind}")
 
-    payload = build_payload(SYSTEM_PROMPT + "\n\n" + prompt, cfg)
+    payload = build_payload(prompt, cfg, template=template_repair)
     fixed = sse_chat_completion(payload, cfg)
     if PRINT_MODEL_OUTPUT:
         _print_model_output(f"{label}::repair::{kind}", fixed)
@@ -570,35 +728,134 @@ def call_with_retries(fn, *, max_retries: int, base_delay: float = 2.0, max_dela
 
 
 # ---------------------------
+# 输出拼装（把综述/前文提要用引用块插入assistant内容）
+# ---------------------------
+
+def _quote_block(title: str, body: str) -> str:
+    body = (body or "").strip()
+    if not body:
+        return ""
+    lines = body.splitlines()
+    out: List[str] = [f"> **{title}**", ">"]
+    for ln in lines:
+        ln = ln.rstrip()
+        if ln:
+            out.append(f"> {ln}")
+        else:
+            out.append(">")
+    return "\n".join(out).strip()
+
+
+def assemble_assistant_content(*, formatted_parts: List[str], summary: str, chunk_summaries: List[str]) -> str:
+    parts = [p.strip() for p in formatted_parts if p and p.strip()]
+    if not parts:
+        return ""
+
+    out: List[str] = []
+    sblock = _quote_block("综述", summary)
+    if sblock:
+        out.append(sblock)
+
+    # 非分片：只加总综述，不加“前文提要”
+    if len(parts) == 1:
+        out.append(parts[0])
+        return "\n\n".join(out).strip()
+
+    # 分片：在每段之间插入“前文提要”（用上一段的chunk_summary）
+    out.append(parts[0])
+    for i in range(1, len(parts)):
+        prev_sum = ""
+        if i - 1 < len(chunk_summaries):
+            prev_sum = chunk_summaries[i - 1]
+        rblock = _quote_block("前文提要", prev_sum)
+        if rblock:
+            out.append(rblock)
+        out.append(parts[i])
+
+    return "\n\n".join([x for x in out if x and x.strip()]).strip()
+
+
+# ---------------------------
 # 处理小说文本（单次/分片）
 # ---------------------------
 
-def process_text(text: str, *, cfg: ChatConfig, max_input_chars: int, label: str, max_retries: int) -> Tuple[str, str, str]:
-    """
-    返回 formatted, summary, user_prompt
+@dataclass
+class ProcessTextResult:
+    formatted_parts: List[str]
+    summary: str
+    chunk_summaries: List[str]  # 与 formatted_parts 等长（分片时），非分片为空
+    user_prompt: str
 
-    关键策略：
-    - 单次：请求失败/解析失败 -> 修复追问 -> 仍失败 -> 重试该次请求
-    - 分片：每个chunk独立重试/修复，不整本打回；final也独立重试/修复
+
+def process_text(
+    text: str,
+    *,
+    cfg: ChatConfig,
+    template_format: str,
+    template_summary: str,
+    template_creative: str,
+    template_repair: str,
+    max_input_chars: int,
+    label: str,
+    max_retries: int,
+) -> ProcessTextResult:
+    """
+    分步骤策略（更贴合不同template）：
+    - format：logical
+    - summary：summary
+    - user_prompt：creative
+
+    分片策略：
+    - 每个chunk独立重试/修复，不整本打回
+    - final(summary合并)独立重试/修复
+    - user_prompt生成独立重试/修复
     """
 
-    def single_attempt() -> Tuple[str, str, str]:
-        user_content = SYSTEM_PROMPT + "\n\n" + USER_PROMPT_TEMPLATE.format(xiaoshuo=text)
-        payload = build_payload(user_content, cfg)
+    def format_attempt(x: str) -> str:
+        prompt = FORMAT_PROMPT_TEMPLATE.format(xiaoshuo=x)
+        payload = build_payload(prompt, cfg, template=template_format)
         raw = sse_chat_completion(payload, cfg)
         if PRINT_MODEL_OUTPUT:
-            _print_model_output(label, raw)
+            _print_model_output(f"{label}::format", raw)
         try:
-            return parse_result_xml(raw)
+            return parse_formatted_xml(raw)
         except ValueError:
             if not XML_REPAIR:
                 raise
-            fixed = repair_xml(raw, kind="result", cfg=cfg, label=label)
-            return parse_result_xml(fixed)
+            fixed = repair_xml(raw, kind="format", cfg=cfg, label=f"{label}::format", template_repair=template_repair)
+            return parse_formatted_xml(fixed)
+
+    def summary_from_formatted_attempt(formatted: str) -> str:
+        prompt = SUMMARY_FROM_FORMATTED_PROMPT_TEMPLATE.format(formatted=formatted)
+        payload = build_payload(prompt, cfg, template=template_summary)
+        raw = sse_chat_completion(payload, cfg)
+        if PRINT_MODEL_OUTPUT:
+            _print_model_output(f"{label}::summary", raw)
+        try:
+            return parse_summary_xml(raw)
+        except ValueError:
+            if not XML_REPAIR:
+                raise
+            fixed = repair_xml(raw, kind="summary", cfg=cfg, label=f"{label}::summary", template_repair=template_repair)
+            return parse_summary_xml(fixed)
+
+    def user_prompt_from_summary_attempt(summary: str) -> str:
+        prompt = USER_PROMPT_FROM_SUMMARY_PROMPT_TEMPLATE.format(summary=summary)
+        payload = build_payload(prompt, cfg, template=template_creative)
+        raw = sse_chat_completion(payload, cfg)
+        if PRINT_MODEL_OUTPUT:
+            _print_model_output(f"{label}::user_prompt", raw)
+        try:
+            return parse_user_prompt_xml(raw)
+        except ValueError:
+            if not XML_REPAIR:
+                raise
+            fixed = repair_xml(raw, kind="user_prompt", cfg=cfg, label=f"{label}::user_prompt", template_repair=template_repair)
+            return parse_user_prompt_xml(fixed)
 
     def chunk_attempt(chunk_text_: str, idx: int) -> Tuple[str, str]:
         prompt = CHUNK_PROMPT_TEMPLATE.format(xiaoshuo=chunk_text_)
-        payload = build_payload(SYSTEM_PROMPT + "\n\n" + prompt, cfg)
+        payload = build_payload(prompt, cfg, template=template_format)
         raw = sse_chat_completion(payload, cfg)
         if PRINT_MODEL_OUTPUT:
             _print_model_output(f"{label}::chunk{idx}", raw)
@@ -607,47 +864,71 @@ def process_text(text: str, *, cfg: ChatConfig, max_input_chars: int, label: str
         except ValueError:
             if not XML_REPAIR:
                 raise
-            fixed = repair_xml(raw, kind="chunk", cfg=cfg, label=f"{label}::chunk{idx}")
+            fixed = repair_xml(raw, kind="chunk", cfg=cfg, label=f"{label}::chunk{idx}", template_repair=template_repair)
             return parse_chunk_xml(fixed)
 
-    def final_attempt(summaries_text: str) -> Tuple[str, str]:
-        final_prompt = FINAL_FROM_SUMMARIES_PROMPT_TEMPLATE.format(summaries=summaries_text)
-        payload = build_payload(SYSTEM_PROMPT + "\n\n" + final_prompt, cfg)
+    def final_summary_attempt(summaries_text: str) -> str:
+        prompt = FINAL_FROM_SUMMARIES_PROMPT_TEMPLATE.format(summaries=summaries_text)
+        payload = build_payload(prompt, cfg, template=template_summary)
         raw = sse_chat_completion(payload, cfg)
         if PRINT_MODEL_OUTPUT:
-            _print_model_output(f"{label}::final", raw)
+            _print_model_output(f"{label}::final_summary", raw)
         try:
-            return parse_final_xml(raw)
+            return parse_summary_xml(raw)  # <final>里也用<summary>，解析同一标签即可
         except ValueError:
             if not XML_REPAIR:
                 raise
-            fixed = repair_xml(raw, kind="final", cfg=cfg, label=f"{label}::final")
-            return parse_final_xml(fixed)
+            fixed = repair_xml(raw, kind="final", cfg=cfg, label=f"{label}::final_summary", template_repair=template_repair)
+            return parse_summary_xml(fixed)
 
-    # 单次处理（也对这一次做重试，不依赖整本重试）
+    def final_both_fallback_attempt(summaries_text: str) -> Tuple[str, str]:
+        prompt = FINAL_BOTH_FROM_SUMMARIES_PROMPT_TEMPLATE.format(summaries=summaries_text)
+        payload = build_payload(prompt, cfg, template=template_repair)
+        raw = sse_chat_completion(payload, cfg)
+        if PRINT_MODEL_OUTPUT:
+            _print_model_output(f"{label}::final_both_fallback", raw)
+        try:
+            return parse_final_both_xml(raw)
+        except ValueError:
+            if not XML_REPAIR:
+                raise
+            fixed = repair_xml(raw, kind="final_both", cfg=cfg, label=f"{label}::final_both_fallback", template_repair=template_repair)
+            return parse_final_both_xml(fixed)
+
+    # 非分片：format -> summary -> user_prompt
     if len(text) <= max_input_chars:
-        result = call_with_retries(single_attempt, max_retries=max_retries)
+        formatted = call_with_retries(lambda: format_attempt(text), max_retries=max_retries)
         time.sleep(cfg.min_delay)
-        return result
+        summary = call_with_retries(lambda: summary_from_formatted_attempt(formatted), max_retries=max_retries)
+        time.sleep(cfg.min_delay)
+        user_prompt = call_with_retries(lambda: user_prompt_from_summary_attempt(summary), max_retries=max_retries)
+        time.sleep(cfg.min_delay)
+        return ProcessTextResult(formatted_parts=[formatted], summary=summary, chunk_summaries=[], user_prompt=user_prompt)
 
-    # 分片处理
+    # 分片：chunk(format+chunk_summary) -> final_summary -> user_prompt
     chunks = chunk_text(text, max_chars=max_input_chars, overlap=200)
     formatted_parts: List[str] = []
-    summaries: List[str] = []
+    chunk_summaries: List[str] = []
 
     for i, ch in enumerate(chunks, start=1):
         fpart, s = call_with_retries(lambda: chunk_attempt(ch, i), max_retries=max_retries)
         formatted_parts.append(fpart.strip())
-        summaries.append(f"[chunk {i}] {s.strip()}")
+        chunk_summaries.append(s.strip())
         time.sleep(cfg.min_delay)
 
-    formatted_full = "\n\n".join(formatted_parts).strip()
-
-    # final 单独重试（不重跑chunks）
-    summary, user_prompt = call_with_retries(lambda: final_attempt("\n".join(summaries)), max_retries=max_retries)
-    time.sleep(cfg.min_delay)
-
-    return formatted_full, summary, user_prompt
+    # final summary 单独重试（不重跑chunks）
+    summaries_text = "\n".join([f"[段落{i}] {s}" for i, s in enumerate(chunk_summaries, start=1)])
+    try:
+        summary = call_with_retries(lambda: final_summary_attempt(summaries_text), max_retries=max_retries)
+        time.sleep(cfg.min_delay)
+        user_prompt = call_with_retries(lambda: user_prompt_from_summary_attempt(summary), max_retries=max_retries)
+        time.sleep(cfg.min_delay)
+        return ProcessTextResult(formatted_parts=formatted_parts, summary=summary, chunk_summaries=chunk_summaries, user_prompt=user_prompt)
+    except Exception:
+        # 兜底：一步到位生成 summary + user_prompt（不影响 chunk 格式化结果）
+        summary2, up2 = call_with_retries(lambda: final_both_fallback_attempt(summaries_text), max_retries=max_retries)
+        time.sleep(cfg.min_delay)
+        return ProcessTextResult(formatted_parts=formatted_parts, summary=summary2, chunk_summaries=chunk_summaries, user_prompt=up2)
 
 
 def iter_files(root: str) -> Iterable[Tuple[str, str]]:
@@ -694,27 +975,45 @@ def process_file(abs_path: str, rel_path: str, *, args, cfg: ChatConfig) -> Task
         )
 
     try:
-        formatted, summary, user_prompt = process_text(
+        r = process_text(
             text,
             cfg=cfg,
+            template_format=args.template_format,
+            template_summary=args.template_summary,
+            template_creative=args.template_creative,
+            template_repair=args.template_repair,
             max_input_chars=args.max_input_chars,
             label=fid,
             max_retries=args.max_retries,
         )
 
+        assistant_content = assemble_assistant_content(
+            formatted_parts=r.formatted_parts,
+            summary=r.summary,
+            chunk_summaries=r.chunk_summaries,
+        )
+
         record = {
             "messages": [
-                {"role": "user", "content": user_prompt.strip()},
-                {"role": "assistant", "content": formatted.strip()},
-            ]
+                {"role": "user", "content": r.user_prompt.strip()},
+                {"role": "assistant", "content": assistant_content.strip()},
+            ],
+            # 扩展字段：按需求把“综述/每段综述/原文”都存下来
+            "summary": (r.summary or "").strip(),
+            "chunk_summaries": [s.strip() for s in (r.chunk_summaries or [])],
+            "source_text": text,  # 清洗后的原文（已统一换行/去控制字符等）
         }
+
         meta = {
             "status": "ok",
             "len_in": len(text),
             "encoding": enc,
-            "len_user_prompt": len(user_prompt),
-            "len_formatted": len(formatted),
-            "has_summary": bool(summary.strip()),
+            "num_chunks": len(r.formatted_parts),
+            "len_user_prompt": len(r.user_prompt or ""),
+            "len_summary": len(r.summary or ""),
+            "len_assistant": len(assistant_content or ""),
+            "has_summary": bool((r.summary or "").strip()),
+            "has_chunk_summaries": bool(r.chunk_summaries),
         }
         return TaskResult(fid=fid, rel_path=rel_path, status="ok", record=record, meta=meta)
 
@@ -732,7 +1031,14 @@ def main():
     ap.add_argument("--out", default="dataset.jsonl", help="输出jsonl路径（默认: dataset.jsonl）")
     ap.add_argument("--state", default="dataset.state.json", help="状态文件路径（默认: dataset.state.json）")
     ap.add_argument("--model", default="dolphinserver:24B", help="模型名（默认与curl.http一致）")
-    ap.add_argument("--template", default="logical", help="template（默认与curl.http一致）")
+
+    # template：拆分为不同步骤使用（避免总是logical）
+    ap.add_argument("--template", default="logical", help="兼容参数：等同于 --template-format（默认: logical）")
+    ap.add_argument("--template-format", default=None, help="格式清洗用template（默认: logical 或由 --template 指定）")
+    ap.add_argument("--template-summary", default="summary", help="总结/合并综述用template（默认: summary）")
+    ap.add_argument("--template-creative", default="creative", help="生成用户提示词用template（默认: creative）")
+    ap.add_argument("--template-repair", default="logical", help="XML修复追问用template（默认: logical）")
+
     ap.add_argument("--timeout", type=int, default=180, help="单次请求超时秒数")
     ap.add_argument("--min-delay", type=float, default=0.6, help="每个worker内请求间最小延迟秒数")
     ap.add_argument("--max-retries", type=int, default=4, help="单次API调用失败重试次数（指数退避）。分片模式下每个chunk与final都单独使用该值。")
@@ -748,11 +1054,15 @@ def main():
                     help="关闭XML不全时的修复追问（默认开启）")
     args = ap.parse_args()
 
+    # 兼容：--template 作为 format template
+    if args.template_format is None:
+        args.template_format = args.template
+
     global PRINT_MODEL_OUTPUT, XML_REPAIR
     PRINT_MODEL_OUTPUT = (not getattr(args, "no_print_model_output", False))
     XML_REPAIR = (not getattr(args, "no_xml_repair", False))
 
-    cfg = ChatConfig(model=args.model, template=args.template, timeout=args.timeout, min_delay=args.min_delay)
+    cfg = ChatConfig(model=args.model, timeout=args.timeout, min_delay=args.min_delay)
 
     out_path = os.path.abspath(args.out)
     state_path = os.path.abspath(args.state)
@@ -775,7 +1085,11 @@ def main():
         return
 
     workers = max(1, int(args.workers))
-    print(f"pending={len(pending)} workers={workers} print_model_output={PRINT_MODEL_OUTPUT} xml_repair={XML_REPAIR}")
+    print(
+        f"pending={len(pending)} workers={workers} "
+        f"templates=format:{args.template_format} summary:{args.template_summary} creative:{args.template_creative} repair:{args.template_repair} "
+        f"print_model_output={PRINT_MODEL_OUTPUT} xml_repair={XML_REPAIR}"
+    )
 
     processed = 0
     skipped = 0
@@ -796,7 +1110,7 @@ def main():
                     state["failed"].pop(r.fid, None)
                     save_state(state_path, state)
                     meta = r.meta or {}
-                    print(f"[ok]   {label} | in={meta.get('len_in')} enc={meta.get('encoding')} out+=1")
+                    print(f"[ok]   {label} | in={meta.get('len_in')} enc={meta.get('encoding')} chunks={meta.get('num_chunks')} out+=1")
                 elif r.status in ("skipped", "dry_run_ok"):
                     skipped += 1
                     state["done"][r.fid] = r.meta or {"status": r.status}
