@@ -498,6 +498,23 @@ def postprocess_short_text(text: str) -> str:
     t = normalize_punctuation_zh(t)
     return t.strip()
 
+def sanitize_chunk_title(title: str) -> str:
+    """
+    段落标题清洗：
+    - 去掉换行/多余空白
+    - 去掉可能的Markdown前缀（#、-等）
+    - 限制长度，避免太长
+    """
+    t = (title or "").replace("\n", " ").replace("\r", " ").strip()
+    t = " ".join(t.split())
+    # 去掉常见markdown/符号前缀
+    t = t.lstrip("#* -—–·:：\t")
+    t = t.strip()
+    if len(t) > 30:
+        t = t[:30].rstrip()
+    return t
+
+
 
 # ---------------------------
 # 分块（处理超长文本）
@@ -703,9 +720,11 @@ FORMAT_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
 CHUNK_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
-你将收到小说的一部分片段（chunk）。请完成两件事：
+你将收到小说的一部分片段（chunk）。
+这是第 {{idx}} 段（共 {{total}} 段）。请完成三件事：
 1) 整理该片段的格式（不得改变意义，可修正标点/换行/少量Markdown，可删除明显无意义重复/乱码/元信息）。
 2) 为该片段写一个“片段摘要”（用于后续合并为总综述，也会用于训练数据中的“前文提要”）。
+3) 为该片段拟一个“段落标题”（用于训练数据中作为该段的小标题）。
 
 {FORMAT_RULES}
 {MARKDOWN_RULES}
@@ -716,12 +735,21 @@ CHUNK_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 - 不要提“chunk/片段/摘要”字样，直接描述内容即可
 - 尽量使用中文标点（，。！？：；等）
 
+段落标题要求：
+- 简短明确：建议 6~20 个汉字
+- 概括本段核心事件/矛盾/场景（类似“上回说道”的小标题）
+- 不要出现“第X段/第X章/chunk/片段”等字样
+- 不要换行，不要写引号或书名号，不要写“作者/来源”等元信息
+
 输出要求（非常重要）：
-- 只输出一个<chunk>根标签，内部必须包含两个标签：<formatted>、<chunk_summary>
+- 只输出一个<chunk>根标签，内部必须包含三个标签：<chunk_title>、<formatted>、<chunk_summary>
 - 不要输出任何多余文字
 
 示例（仅示意格式）：
 <chunk>
+<chunk_title>
+...段落标题...
+</chunk_title>
 <formatted>
 ...整理后的片段...
 </formatted>
@@ -873,14 +901,13 @@ def parse_user_prompt_xml(raw: str) -> str:
     return user_prompt.strip()
 
 
-def parse_chunk_xml(raw: str) -> Tuple[str, str]:
+def parse_chunk_xml(raw: str) -> Tuple[str, str, str]:
     formatted = _extract_tag(raw, "formatted")
     chunk_summary = _extract_tag(raw, "chunk_summary")
+    chunk_title = _extract_tag(raw, "chunk_title") or ""
     if not formatted or not chunk_summary:
         raise ValueError("XML不完整：缺少 <formatted> 或 <chunk_summary>")
-    return formatted.strip(), chunk_summary.strip()
-
-
+    return formatted.strip(), chunk_summary.strip(), chunk_title.strip()
 def parse_final_both_xml(raw: str) -> Tuple[str, str]:
     summary = _extract_tag(raw, "summary") or ""
     user_prompt = _extract_tag(raw, "user_prompt")
@@ -942,7 +969,7 @@ REPAIR_CHUNK_TEMPLATE = """你刚才的输出可能不是严格合规的XML，�
 请你基于“原始输出文本”尽最大可能恢复为一个严格合规的XML，并且只输出XML本身。
 
 规则：
-- 必须只输出一个<chunk>根标签，且包含且仅包含：<formatted>、<chunk_summary>
+- 必须只输出一个<chunk>根标签，且包含且仅包含：<chunk_title>、<formatted>、<chunk_summary>
 - 所有标签必须成对闭合
 - 不要输出任何解释、前后缀、代码块
 - 不要编造新内容：尽量从原始输出中提取并整理；如果无法恢复，可留空字符串，但标签必须存在
@@ -1094,7 +1121,7 @@ def _quote_block(title: str, body: str) -> str:
     return "\n".join(out).strip()
 
 
-def assemble_assistant_content(*, formatted_parts: List[str], summary: str, chunk_summaries: List[str]) -> str:
+def assemble_assistant_content(*, formatted_parts: List[str], summary: str, chunk_summaries: List[str], chunk_titles: List[str]) -> str:
     parts = [p.strip() for p in formatted_parts if p and p.strip()]
     if not parts:
         return ""
@@ -1104,34 +1131,44 @@ def assemble_assistant_content(*, formatted_parts: List[str], summary: str, chun
     if sblock:
         out.append(sblock)
 
-    # 非分片：只加总综述，不加“前文提要”
+    # 非分片：只加总综述，不加“前文提要/段落标题”
     if len(parts) == 1:
         out.append(parts[0])
         return "\n\n".join(out).strip()
 
-    # 分片：在每段之间插入“前文提要”（用上一段的chunk_summary）
+    def title_for(i: int) -> str:
+        # i: 1-based
+        t = ""
+        if 0 <= i - 1 < len(chunk_titles):
+            t = (chunk_titles[i - 1] or "").strip()
+        if not t:
+            return f"## 第{i}段"
+        t = " ".join(t.split())
+        if len(t) > 30:
+            t = t[:30].rstrip()
+        return f"## 第{i}段：{t}"
+
+    # 分片：每段前插入“段落标题”；段与段之间插入“前文提要”
+    out.append(title_for(1))
     out.append(parts[0])
-    for i in range(1, len(parts)):
+
+    for i in range(2, len(parts) + 1):
         prev_sum = ""
-        if i - 1 < len(chunk_summaries):
-            prev_sum = chunk_summaries[i - 1]
+        if i - 2 < len(chunk_summaries):
+            prev_sum = chunk_summaries[i - 2]
         rblock = _quote_block("前文提要", prev_sum)
         if rblock:
             out.append(rblock)
-        out.append(parts[i])
+        out.append(title_for(i))
+        out.append(parts[i - 1])
 
     return "\n\n".join([x for x in out if x and x.strip()]).strip()
-
-
-# ---------------------------
-# 处理小说文本（单次/分片）
-# ---------------------------
-
 @dataclass
 class ProcessTextResult:
     formatted_parts: List[str]
     summary: str
     chunk_summaries: List[str]  # 与 formatted_parts 等长（分片时），非分片为空
+    chunk_titles: List[str]  # 与 formatted_parts 等长（分片时），非分片为空
     user_prompt: str
 
 
@@ -1197,8 +1234,8 @@ def process_text(
             fixed = repair_xml(raw, kind="user_prompt", cfg=cfg, label=f"{label}::user_prompt", template_repair=template_repair)
             return parse_user_prompt_xml(fixed)
 
-    def chunk_attempt(chunk_text_: str, idx: int) -> Tuple[str, str]:
-        prompt = CHUNK_PROMPT_TEMPLATE.format(xiaoshuo=chunk_text_)
+    def chunk_attempt(chunk_text_: str, idx: int, total: int) -> Tuple[str, str, str]:
+        prompt = CHUNK_PROMPT_TEMPLATE.format(xiaoshuo=chunk_text_, idx=idx, total=total)
         payload = build_payload(prompt, cfg, template=template_format)
         raw = sse_chat_completion(payload, cfg)
         if PRINT_MODEL_OUTPUT:
@@ -1253,17 +1290,19 @@ def process_text(
         user_prompt = postprocess_short_text(user_prompt)
         time.sleep(cfg.min_delay)
 
-        return ProcessTextResult(formatted_parts=[formatted], summary=summary, chunk_summaries=[], user_prompt=user_prompt)
+        return ProcessTextResult(formatted_parts=[formatted], summary=summary, chunk_summaries=[], chunk_titles=[], user_prompt=user_prompt)
 
     # 分片：chunk(format+chunk_summary) -> final_summary -> user_prompt
     chunks = chunk_text(text, max_chars=max_input_chars, lookback=chunk_lookback)
     formatted_parts: List[str] = []
     chunk_summaries: List[str] = []
+    chunk_titles: List[str] = []
 
     for i, ch in enumerate(chunks, start=1):
-        fpart, s = call_with_retries(lambda: chunk_attempt(ch, i), max_retries=max_retries)
+        fpart, ssum, stitle = call_with_retries(lambda: chunk_attempt(ch, i, len(chunks)), max_retries=max_retries)
         formatted_parts.append(postprocess_formatted_text(fpart))
-        chunk_summaries.append(postprocess_short_text(s))
+        chunk_summaries.append(postprocess_short_text(ssum))
+        chunk_titles.append(sanitize_chunk_title(postprocess_short_text(stitle)))
         time.sleep(cfg.min_delay)
 
     summaries_text = "\n".join([f"[段落{i}] {s}" for i, s in enumerate(chunk_summaries, start=1)])
@@ -1277,13 +1316,13 @@ def process_text(
         user_prompt = postprocess_short_text(user_prompt)
         time.sleep(cfg.min_delay)
 
-        return ProcessTextResult(formatted_parts=formatted_parts, summary=summary, chunk_summaries=chunk_summaries, user_prompt=user_prompt)
+        return ProcessTextResult(formatted_parts=formatted_parts, summary=summary, chunk_summaries=chunk_summaries, chunk_titles=chunk_titles, user_prompt=user_prompt)
     except Exception:
         summary2, up2 = call_with_retries(lambda: final_both_fallback_attempt(summaries_text), max_retries=max_retries)
         summary2 = postprocess_short_text(summary2)
         up2 = postprocess_short_text(up2)
         time.sleep(cfg.min_delay)
-        return ProcessTextResult(formatted_parts=formatted_parts, summary=summary2, chunk_summaries=chunk_summaries, user_prompt=up2)
+        return ProcessTextResult(formatted_parts=formatted_parts, summary=summary2, chunk_summaries=chunk_summaries, chunk_titles=chunk_titles, user_prompt=up2)
 
 
 def iter_files(root: str) -> Iterable[Tuple[str, str]]:
@@ -1347,6 +1386,7 @@ def process_file(abs_path: str, rel_path: str, *, args, cfg: ChatConfig) -> Task
             formatted_parts=r.formatted_parts,
             summary=r.summary,
             chunk_summaries=r.chunk_summaries,
+            chunk_titles=r.chunk_titles,
         )
 
         record = {
@@ -1356,6 +1396,7 @@ def process_file(abs_path: str, rel_path: str, *, args, cfg: ChatConfig) -> Task
             ],
             "summary": (r.summary or "").strip(),
             "chunk_summaries": [s.strip() for s in (r.chunk_summaries or [])],
+            "chunk_titles": [t.strip() for t in (r.chunk_titles or [])],
             "source_text": text,
         }
 
@@ -1369,6 +1410,7 @@ def process_file(abs_path: str, rel_path: str, *, args, cfg: ChatConfig) -> Task
             "len_assistant": len(assistant_content or ""),
             "has_summary": bool((r.summary or "").strip()),
             "has_chunk_summaries": bool(r.chunk_summaries),
+            "has_chunk_titles": bool(r.chunk_titles),
         }
         return TaskResult(fid=fid, rel_path=rel_path, status="ok", record=record, meta=meta)
 
