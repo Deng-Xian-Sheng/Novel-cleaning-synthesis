@@ -1,0 +1,2 @@
+# 可选但强烈建议：用于自动探测文本编码（比chardet更现代）
+charset-normalizer>=3.3.2
