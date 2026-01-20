@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-小说数据合成脚本（生成 OpenAI messages 格式 jsonl）
+文章数据合成脚本（生成 OpenAI messages 格式 jsonl）
 
 核心目标：
-- 读取小说文本
+- 读取文章文本
 - 清洗（仅做格式修正，不改写内容）
-- 生成：用户提示词 / 综述 / 分段综述 / 整理后的小说正文
+- 生成：用户提示词 / 综述 / 分段综述 / 整理后的文章正文
 - 输出为训练数据 jsonl（OpenAI messages）
 
 重要设计说明：
@@ -18,7 +18,7 @@
 2) template 选择：
    - logical：适合做“格式修正/结构化输出/XML修复”
    - summary ：适合做“综述/摘要合并”
-   - creative：适合做“用户提示词（让模型写小说的指令）”
+   - creative：适合做“用户提示词（让模型写文章的指令）”
 
 3) 分片策略：
    - chunk 逐片处理：每片单独重试/修复（不整本打回）
@@ -667,7 +667,7 @@ def build_payload(user_content: str, cfg: ChatConfig, *, template: str) -> Dict:
 
 BASE_XML_INSTRUCTIONS = """你是一个严格的文本处理助手。你必须严格按要求输出XML标签，不要输出任何额外解释、前后缀、代码块。"""
 
-FORMAT_RULES = """你只能对文本“格式”做优化（标点、换行、段落、标题、少量Markdown排版），不得改写小说表达的意义与具体内容。
+FORMAT_RULES = """你只能对文本“格式”做优化（标点、换行、段落、标题、少量Markdown排版），不得改写文章表达的意义与具体内容。
 
 必须遵守：
 1) 统一输出为【简体中文】：如果原文包含繁体字，请转换为简体字（不改变含义）。
@@ -682,21 +682,21 @@ MARKDOWN_RULES = """Markdown排版增强（能做就做）：
 - 对话建议“一人一句成段”，不同人物说话尽量分成不同段落。
 - 章节/卷/回/番外/序章等标题行：尽量使用Markdown标题（优先 `## 标题`；整书大标题可用 `# 标题`）。
 - 需要分隔的地方：优先使用 `---`，并保证分隔线前后各有空行。
-- 不要滥用列表/表格；保证小说正文可读性。"""
+- 不要滥用列表/表格；保证文章正文可读性。"""
 
 SUMMARY_RULES = """请写一段较短但信息密度高的综述，尽量包含：主线、关键人物关系、核心冲突、阶段性转折、结局走向；如果原文未完结/无结局，请明确说明。"""
 
-USER_PROMPT_RULES = """基于给定的“综述”，生成一条【给大模型的用户指令】（user prompt），目标是让模型创作出与该小说一致的故事（人物、背景、冲突、走向尽量贴合）。
+USER_PROMPT_RULES = """基于给定的“综述”，生成一条【给大模型的用户指令】（user prompt），目标是让模型创作出与该文章一致的故事（人物、背景、冲突、走向尽量贴合）。
 要求：
 - 这条指令应当像真实用户在聊天框里发出的请求，不能提“根据综述/根据摘要/如下综述”等字眼。
 - 可长可短：短则抓住最突出的要点；长则覆盖更多细节。
-- 表达方式尽量多样（例如“请写一篇小说……/写个故事……/创作一段长篇……”等），但必须忠于综述，不要杜撰综述未提到的关键设定。
+- 表达方式尽量多样（例如“请写一篇文章……/写个故事……/创作一段长篇……”等），但必须忠于综述，不要杜撰综述未提到的关键设定。
 - 尽量把“你希望模型写出来的东西”说清楚：题材风格（若能从综述推断）、主角/关系、开端处境、关键矛盾、故事节奏与结尾倾向（开放/悲剧/圆满等）。
 - 只输出一条用户提示词，不要多条备选。"""
 
 FORMAT_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
-你将收到小说原文（可能包含乱码、缺标点、断行紊乱等）。请完成：整理小说格式。
+你将收到文章原文（可能包含乱码、缺标点、断行紊乱等）。请完成：整理文章格式。
 
 {FORMAT_RULES}
 {MARKDOWN_RULES}
@@ -712,7 +712,7 @@ FORMAT_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 </formatted>
 </format>
 
-下面是小说原文：
+下面是文章原文：
 <xiaoshuo>
 {{xiaoshuo}}
 </xiaoshuo>
@@ -720,7 +720,7 @@ FORMAT_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
 CHUNK_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
-你将收到小说的一部分片段（chunk）。
+你将收到文章的一部分片段（chunk）。
 这是第 {{idx}} 段（共 {{total}} 段）。请完成三件事：
 1) 整理该片段的格式（不得改变意义，可修正标点/换行/少量Markdown，可删除明显无意义重复/乱码/元信息）。
 2) 为该片段写一个“片段摘要”（用于后续合并为总综述，也会用于训练数据中的“前文提要”）。
@@ -766,7 +766,7 @@ CHUNK_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
 SUMMARY_FROM_FORMATTED_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
-你将收到“整理后的小说正文”。请基于该正文写一段总综述。
+你将收到“整理后的文章正文”。请基于该正文写一段总综述。
 
 {SUMMARY_RULES}
 
@@ -781,7 +781,7 @@ SUMMARY_FROM_FORMATTED_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 </summary>
 </summary_result>
 
-整理后的小说正文如下：
+整理后的文章正文如下：
 <formatted_text>
 {{formatted}}
 </formatted_text>
@@ -789,7 +789,7 @@ SUMMARY_FROM_FORMATTED_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
 FINAL_FROM_SUMMARIES_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
-你将收到多个“片段摘要”。请将它们合并为小说的总综述。
+你将收到多个“片段摘要”。请将它们合并为文章的总综述。
 
 {SUMMARY_RULES}
 
@@ -827,7 +827,7 @@ USER_PROMPT_FROM_SUMMARY_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 示例：
 <prompt_result>
 <user_prompt>
-请写一篇小说，讲述……
+请写一篇文章，讲述……
 </user_prompt>
 </prompt_result>
 
@@ -840,7 +840,7 @@ USER_PROMPT_FROM_SUMMARY_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 # 兜底：一步到位生成 summary + user_prompt
 FINAL_BOTH_FROM_SUMMARIES_PROMPT_TEMPLATE = f"""{BASE_XML_INSTRUCTIONS}
 
-你将收到多个片段摘要，请合并为小说的总综述，并基于总综述生成用户提示词。
+你将收到多个片段摘要，请合并为文章的总综述，并基于总综述生成用户提示词。
 
 总综述要求：
 {SUMMARY_RULES}
@@ -1423,8 +1423,8 @@ def process_file(abs_path: str, rel_path: str, *, args, cfg: ChatConfig) -> Task
 # ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="小说->训练数据(jsonl)合成脚本（SSE接口）")
-    ap.add_argument("--root", default="小说", help="小说目录（默认: 小说）")
+    ap = argparse.ArgumentParser(description="文章->训练数据(jsonl)合成脚本（SSE接口）")
+    ap.add_argument("--root", default="小说", help="文章目录（默认: 小说）")
     ap.add_argument("--out", default="dataset.jsonl", help="输出jsonl路径（默认: dataset.jsonl）")
     ap.add_argument("--state", default="dataset.state.json", help="状态文件路径（默认: dataset.state.json）")
     ap.add_argument("--model", default="dolphinserver:24B", help="模型名（默认与curl.http一致）")
