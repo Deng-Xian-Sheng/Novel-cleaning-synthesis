@@ -1443,7 +1443,7 @@ def main():
 
     ap.add_argument("--chunk-lookback", type=int, default=100, help="分片时在 max-input-chars 附近向前寻找自然切分点的范围（优先换行，其次句号等；默认100）")
 
-    ap.add_argument("--min-chars", type=int, default=200, help="过短文本跳过（默认200）")
+    ap.add_argument("--min-chars", type=int, default=0, help="过短文本跳过（默认0）")
     ap.add_argument("--max-files", type=int, default=0, help="最多处理多少个文件（0表示不限制）")
     ap.add_argument("--workers", type=int, default=1, help="并发worker数（默认1）")
     ap.add_argument("--show-path", action="store_true", help="打印文件相对路径（默认不打印，避免泄露）")
