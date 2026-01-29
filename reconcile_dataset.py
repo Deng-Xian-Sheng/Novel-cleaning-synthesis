@@ -230,7 +230,7 @@ def main():
     ap.add_argument("--dataset", required=True, help="dataset.json 或 dataset.jsonl（含 source_text 字段）")
     ap.add_argument("--state", required=True, help="dataset.state.json")
     ap.add_argument("--main", default="main.py", help="用于读取/清洗/哈希的 main.py 路径（默认 ./main.py）")
-    ap.add_argument("--min-chars", type=int, default=10, help="过短文本阈值（默认10）")
+    ap.add_argument("--min-chars", type=int, default=30, help="过短文本阈值（默认30）")
     ap.add_argument("--backup-dir", default="", help="备份文件输出目录（默认与原文件同目录）")
     ap.add_argument("--dry-run", action="store_true", help="只统计，不落盘修改")
     ap.add_argument("--prune-orphans", action="store_true",
