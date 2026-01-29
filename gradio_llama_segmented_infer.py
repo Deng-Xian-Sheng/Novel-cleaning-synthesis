@@ -148,9 +148,6 @@ def iter_chat_completions_stream(
     cfg: LlamaConfig,
     messages: List[Dict[str, str]],
 ) -> Generator[str, None, None]:
-    """
-    解析 SSE 流：兼容 OpenAI 风格 `data: {...}` 与少数实现的“裸 JSON 行”。
-    """
     url = cfg.base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": cfg.model,
@@ -161,13 +158,31 @@ def iter_chat_completions_stream(
         "max_tokens": cfg.max_tokens,
     }
 
-    with requests.post(url, json=payload, stream=True, timeout=cfg.timeout) as resp:
+    headers = {
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
+    with requests.post(url, json=payload, headers=headers, stream=True, timeout=cfg.timeout) as resp:
         resp.raise_for_status()
-        for raw_line in resp.iter_lines(decode_unicode=True):
+
+        # 关键：很多 server 不在响应头里声明 charset，requests 可能默认 ISO-8859-1
+        resp.encoding = "utf-8"
+
+        # 关键：不要让 requests 自己 decode_unicode；我们自己按 utf-8 解码
+        for raw_line in resp.iter_lines(decode_unicode=False):
             if not raw_line:
                 continue
 
-            line = raw_line.strip()
+            # raw_line is bytes
+            if isinstance(raw_line, (bytes, bytearray)):
+                line = raw_line.decode("utf-8", errors="replace").strip()
+            else:
+                line = str(raw_line).strip()
+
+            if not line:
+                continue
+
             if line.startswith("data:"):
                 data = line[5:].strip()
                 if data == "[DONE]":

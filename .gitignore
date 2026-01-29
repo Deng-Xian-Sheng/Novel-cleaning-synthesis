@@ -211,3 +211,4 @@ __marimo__/
 /dataset.*
 /llama-b*
 /*.zip
+/*.gguf
