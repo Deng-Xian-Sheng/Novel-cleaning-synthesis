@@ -213,3 +213,4 @@ __marimo__/
 /*.zip
 /*.gguf
 /yilin_articles
+/lora_model

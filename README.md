@@ -52,3 +52,7 @@ python segment_dataset.py   --input dataset.jsonl   --output dataset.segmented.j
 ```
 
 `gradio_llama_segmented_infer.py`llama-server推理时的软件工程，它实现了长上下文时分段推理，类似于agent。
+
+---
+
+2025/02/16更新，现在它有训练相关的ipynb了。`Qwen3_(4B)_Instruct.ipynb`（sft）没问题了，但是`grpo.ipynb`（grpo）还有一些问题没有解决。`grpo.ipynb`实现了一个基于grpo的强化学习方法，具体来说，通过`Qwen3-Embedding-0.6B`把模型回答和数据集中的答案转换成向量，然后计算它们之间的距离，近则正奖励，远则负奖励。
