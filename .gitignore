@@ -215,3 +215,9 @@ __marimo__/
 /yilin_articles
 /lora_model
 /记事本.txt
+/use-qwen-code-gen-novel/milvus-docs
+/use-qwen-code-gen-novel/qwen-code
+/use-qwen-code-gen-novel/write_novel/novel
+/use-qwen-code-gen-novel/dataset.jsonl
+/use-qwen-code-gen-novel/index_progress.json
+/milvus/volumes
